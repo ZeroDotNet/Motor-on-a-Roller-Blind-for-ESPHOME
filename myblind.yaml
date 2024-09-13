@@ -25,7 +25,7 @@ substitutions:
   devicename: roller-blind
   upper_devicename: Roller Blind
   mystepper: my_stepper # Name of the stepper motor (leave as is)
-  speed: 350 steps/s # Set the speed of the motor
+  speed: 550 steps/s # Set the speed of the motor
   reportin: "0" # Set if you want the blind to report position while moving (causes delay)
   stepmode: "FULL_STEP"
   pina: GPIO32 # Swap these \_ coil a
@@ -126,6 +126,7 @@ stepper:
     acceleration: inf
     deceleration: inf
     step_mode: $stepmode # Set to HALF_STEP for more torque
+
 globals:
   - id: mystepper_global # Integer for storing the stepper position in case of reboot
     type: int
@@ -153,12 +154,12 @@ globals:
   - id: max_speed
     type: float
     restore_value: yes
-    initial_value: "350"
+    initial_value: "500"
 
 text_sensor:
   - platform: version
     name: ${upper_devicename} ESPHome Version
-    hide_timestamp: true
+    hide_timestamp: false
   - platform: wifi_info
     ip_address:
       name: ${upper_devicename} IP
@@ -170,31 +171,40 @@ text_sensor:
       name: "${upper_devicename} MAC"
       icon: mdi:identifier
   - platform: template
-    name: ${upper_devicename} Friendly Name
+    name: Friendly Name
     icon: "mdi:information-outline"
+    update_interval: 360s
     lambda: |-
       return {"$upper_devicename"};
   - platform: template
-    name: ${upper_devicename} Uptime
+    name: Uptime
     id: uptime_human
     icon: mdi:clock-start
+    update_interval: 60s
   - platform: template
-    name: ${upper_devicename} Speed
+    name: Speed
     id: sensor_speed
+    entity_category: diagnostic
     lambda: |-
-      return {"$speed"};
+      return {String(id(max_speed)).c_str()};
+    filters:
+      - lambda: |-
+          return "" + x + "";
     icon: mdi:speedometer
+    update_interval: 60s
   - platform: template
-    name: ${upper_devicename} GPIOs
+    name: Internal Configuration
     entity_category: diagnostic
     id: sensor_gpios
+    update_interval: 120s
     icon: mdi:identifier
     lambda: |-
-      return {"$pina / $pinb / $pinc / $pind"};
+      return {"Stepper: $pina / $pinb / $pinc / $pind / $stepmode / Button: GPIO19"};
   - platform: template
-    name: ${upper_devicename} Current Position
+    name: Current Position
     id: sensor_current_position
     entity_category: diagnostic
+    update_interval: 15s
     icon: mdi:speedometer
     lambda: |-
       return {String(id(mystepper_global)).c_str()};
@@ -208,14 +218,17 @@ output:
 
 binary_sensor:
   - platform: status
-    name: ${upper_devicename} Status
+    name: Connection Status
+    id: status_sensor
+    icon: mdi:information-outline
+    
   - platform: gpio
     pin:
       number: GPIO19 # Connect Button to GPIO19 and GND
       mode: INPUT_PULLUP
       inverted: True
-    name: Button
-    internal: True
+    name: GPIO - Start/Stop
+    internal: False
     on_click:
       - min_length: 50ms
         max_length: 500ms
@@ -241,47 +254,50 @@ binary_sensor:
               id: settingmode
               value: "1"
 number:
-  - platform: homeassistant
-    id: current_max_speed
-    entity_id: number.current_max_speed
-    name: ${upper_devicename} Current Speed
+  - platform: template
+    id: current_max_speed_raw
+    name: ${upper_devicename} - Speed
     icon: mdi:speedometer
     mode: SLIDER
+    min_value: 1
+    max_value: 650
+    step: 1
+    initial_value: 500
+    restore_value: True
     on_value:
       then:
         - stepper.set_speed:
             id: $mystepper
-            speed: !lambda "return 0 + id(current_max_speed).state;"
-sensor:
-  - platform: template
-    id: "speed"
-    internal: true
-    on_raw_value:
-      then:
-        - number.set:
-            id: current_max_speed
-            value: !lambda "return x;"
-        
+            speed: !lambda "return 0 + id(current_max_speed_raw).state;"
         - text_sensor.template.publish:
             id: sensor_speed
             state: !lambda |-
-              return (String("${speed}")).c_str();
-  - platform: template
-    id: "gpios"
-    internal: true
-    entity_category: diagnostic
-    on_raw_value:
-      then:
-        - text_sensor.template.publish:
-            id: sensor_gpios
-            state: !lambda |-
-              return ("A: " + String("${pina}") + " B: " + String("${pinb}") + " C: " + String("${pinc}") + " D: " + String("${pind}")).c_str();
+              return String(id(current_max_speed_raw).state).c_str();
+    optimistic: True
+sensor:
+  # - platform: template
+  #   id: "speed"
+  #   internal: false
+  #   name: ${upper_devicename} - Speed
+  #   entity_category: diagnostic
+  #   update_interval: 60s
+  #   on_raw_value:
+  #     then:
+  #       # - number.set:
+  #       #     id: current_max_speed_raw
+  #       #     value: !lambda "return x;"
+  #       - text_sensor.template.publish:
+  #           id: sensor_speed
+  #           state: !lambda |-
+  #             return (String("${speed}")).c_str();
   
   # Uptime sensor.
   - platform: uptime
-    name: ${upper_devicename} Uptime Internal
+    name: ${upper_devicename} Uptime
     id: "upptime"
     internal: True
+    device_class: duration
+    update_interval: 60s
     on_raw_value:
       then:
         - text_sensor.template.publish:
@@ -307,7 +323,7 @@ sensor:
 
 switch:
   - platform: template
-    name: ${upper_devicename} Setup Switch # Switch to enter Setup Mode
+    name: Setup Switch # Switch to enter Setup Mode
     id: setupswitch
     lambda: |-
       if (id(settingmode) != 0) {
@@ -330,7 +346,21 @@ switch:
 
 button:
   - platform: template
-    name: ${upper_devicename} Setup Button # Software Button to replicate the Physical Button
+    name: ${upper_devicename} - Start/Stop # Physical Button to setup the blind
+    id: runbutton
+    on_press: 
+      then:
+        - if: # If blind is closed
+            condition:
+              - lambda: "return id(openclosed) == 0;"
+            then: # Open blind
+              - logger.log: "Opening"
+              - cover.open: blinded
+            else: # Close blind
+              - logger.log: "Closing"
+              - cover.close: blinded
+  - platform: template
+    name: ${upper_devicename} - Setup # Software Button to replicate the Physical Button
     id: hasetup
     on_press:
       - if: # If settings variable is on
@@ -338,7 +368,9 @@ button:
             - lambda: "return id(settingmode) != 0;"
           then: # Enter Setting Mode
             - script.execute: setupbutton
-
+  - platform: restart
+    name: ${upper_devicename} - Restart
+    id: restartbutton
 cover:
   - platform: template
     name: $upper_devicename
@@ -467,7 +499,6 @@ cover:
             current_operation: IDLE
     has_position: true
     device_class: blind
-
 script:
   - id: setupbutton
     then:
